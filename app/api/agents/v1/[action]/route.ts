@@ -8,6 +8,7 @@ import {
   getMarketContractId,
   isContractAddress,
   isMarketConfigured,
+  validateNetworkPassphrase,
 } from "@/lib/stellar";
 import { publishReasoning } from "@/lib/reasoning/publish";
 import {
@@ -196,6 +197,11 @@ function clientIp(req: Request): string | undefined {
 }
 
 export async function POST(req: Request, context: { params: Promise<{ action: string }> }): Promise<Response> {
+  try {
+    validateNetworkPassphrase();
+  } catch (err: any) {
+    return json({ error: { message: err.message, detail: "dependency-failure" } }, 503);
+  }
   const { action: rawAction } = await context.params;
   if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) return json({ error: { message: "unknown action" } }, 404);
   const action = rawAction as AgentApiAction;
