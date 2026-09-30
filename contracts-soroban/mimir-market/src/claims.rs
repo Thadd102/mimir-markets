@@ -24,6 +24,10 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
     if params.question.is_empty() {
         return Err(Error::EmptyQuestion);
     }
+    // Bound the metadata this claim will commit to persistent storage BEFORE
+    // any money moves: an over-long claim is refused with nothing escrowed and
+    // no claim id consumed, so a rejected caller can retry with less text.
+    util::validate_create_metadata(env, &params)?;
 
     let usdc = storage::usdc(env)?;
     escrow::pull(env, &usdc, &creator, params.stake_amount)?;
@@ -150,7 +154,8 @@ pub fn challenge_claim(
             return Err(Error::AlreadyChallenged);
         }
     }
-    if claim.challenger_count >= claim.market.max_challengers {
+    let max_challengers = claim.market.max_challengers.min(MAX_CHALLENGERS);
+    if claim.challenger_count >= max_challengers || list.len() >= max_challengers {
         return Err(Error::ClaimFull);
     }
     if stake_amount < MIN_STAKE {
