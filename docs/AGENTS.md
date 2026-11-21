@@ -27,6 +27,8 @@ lib/x402/server.ts	x402 v2 seller paywall (@x402/next) + settlement recording
 lib/x402/buyer.ts	x402 v2 buyer with a hard USDC budget cap (@x402/fetch)
 agents/oracle/index.ts	Off-chain AI oracle agent (LLM + local keypair)
 agents/market-creator/index.ts	Autonomous market creator (LLM + local keypair)
+agents/market-creator/drafting.ts	LLM candidate drafting with explicit time-zone interpretation and UTC deadline normalization
+agents/market-creator/dedupe.ts	Candidate signature normalization across time zones and duplicate filtering
 agents/council/	Ten AI personas that stake as economic actors
 fixtures/ledger/	Versioned public-chain captures for deterministic offline replay
 deploy/deploy.ts	Soroban build/deploy/initialize script
@@ -75,6 +77,8 @@ environment behavior.
 | `lib/x402/buyer.ts` | x402 v2 buyer with a hard USDC budget cap (`@x402/fetch`) |
 | `agents/oracle/index.ts` | Off-chain AI oracle agent (LLM + local keypair) |
 | `agents/market-creator/index.ts` | Autonomous market creator (LLM + local keypair) |
+| `agents/market-creator/drafting.ts` | LLM candidate drafting with explicit time-zone interpretation and UTC deadline normalization |
+| `agents/market-creator/dedupe.ts` | Candidate signature normalization across time zones and duplicate filtering |
 | `agents/council/` | Ten AI personas that stake as economic actors |
 | `fixtures/ledger/` | Versioned public-chain captures for deterministic offline replay |
 | `deploy/deploy.ts` | Soroban build/deploy/initialize script |
@@ -322,6 +326,13 @@ https://faucet.circle.com
 Explorer: https://stellar.expert/explorer/testnet
 Public endpoints (rate-limited): https://soroban-testnet.stellar.org and
 https://horizon-testnet.stellar.org
+
+## Market-creator deadline time-zone interpretation and deduplication
+
+The market creator drafts questions and avoids duplicate generated markets before on-chain creation (`agents/market-creator/drafting.ts` and `agents/market-creator/dedupe.ts`):
+
+- **Explicit time-zone interpretation and canonical UTC deadlines** (`parseExplicitDeadline`, `interpretDeadline`, `resolveCandidateDeadline`): validates that every generated deadline carries an explicit time-zone interpretation (`Z`, numeric UTC offset like `+02:00` or `-05:00`, RFC 9557 bracketed zone annotation, or an explicit IANA zone like `America/New_York`). Normalizes deadlines to canonical UTC ISO-8601 timestamps while retaining `sourceZone` and structured `deadlineInterpretation` as metadata. Rejects ambiguous local-only deadlines that omit an explicit time-zone designator, ambiguous abbreviations (`EST`, `PST`, `CET`), offset-timezone mismatches, and DST gap/ambiguity instants.
+- **Deduplication** (`filterDuplicateCandidates`, `buildCandidateSignature`): drops any candidate whose statement collides with an earlier candidate in the batch or an active on-chain claim. Cross-timezone equivalent deadlines resolve to the same canonical UTC instant in signatures, preventing duplicate market creation on-chain while preserving source zone provenance.
 
 ## Traders
 
