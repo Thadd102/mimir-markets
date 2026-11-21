@@ -202,6 +202,13 @@ Keep the `council_bonus_payouts` table for audit and manual reconciliation.
 No schema migration or contract redeploy is needed for the funded market
 state; the new table is created by the existing database bootstrap.
 
+### Versioned council ballot commitment
+
+Before evaluating quorum or peer-reasoning outcomes, council ballots can be sealed with a versioned SHA-256 commitment (`COUNCIL_BALLOT_COMMITMENT_VERSION = 1` in `lib/council/quorum.ts` and `PEER_REASONING_COMMITMENT_VERSION = 1` in `agents/council/shared/peer-reasoning.ts`):
+
+- **Bound fields:** Canonical participant identities (persona slugs, optional case-sensitive wallet addresses, and jury track), `claimId`, `claimRevision`, the canonical `eligibleVoteSet`, the approved `votingBoundaryMs`, and the folded ballot snapshot.
+- **Boundary enforcement:** `createBallotCommitment`, `verifyBallotCommitment`, `evaluateQuorum`, and `buyPeerReasoning` reject any ballot or peer-reasoning read that is recorded or altered after `votingBoundaryMs`, comes from a persona outside `eligibleVoteSet`, mismatches a bound participant identity or `claimRevision`, or fails version/digest verification (`action: "abort_invalid_commitment"`).
+
 ---
 
 ## Rate-limit strategy
