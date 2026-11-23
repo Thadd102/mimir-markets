@@ -145,6 +145,10 @@ export interface ModeDecision {
   settlementMode: SettlementMode;
   modifiers: ProductModifier[];
   disposition: ProposalDisposition;
+  /** Stable machine-readable decision code for creator reports. */
+  decisionCode: CreatorDecisionCode;
+  /** Which half of the category budget was exhausted, when `decisionCode === "category_budget_exhausted"`. */
+  categoryBudgetLimitedBy?: "markets" | "exposure";
   /** Why this mode, in one line, stored with the proposal for review. */
   rationale: string;
   /** Reason a proposal was downgraded or skipped. */
