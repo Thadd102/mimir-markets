@@ -16,6 +16,7 @@ The point isn't to find a single "best" trader. It's the opposite: by giving ten
 - [Decision pipeline](#decision-pipeline)
 - [Self-resolving settlement](#self-resolving-settlement)
 - [Rate-limit strategy](#rate-limit-strategy)
+- [Quorum, equivocation, and outage resilience](#quorum-equivocation-and-outage-resilience)
 - [Local setup](#local-setup)
 - [Production deploy](#production-deploy)
 - [Configuration reference](#configuration-reference)
@@ -174,7 +175,7 @@ The mechanism lives in `agents/oracle/council-vote.ts` (pure scoring math is uni
 | Variable | Default | Effect |
 |---|---|---|
 | `COUNCIL_SELF_RESOLVING` | off | `1` enables the mechanism (requires `COUNCIL_SETTLEMENT=1`) |
-| `COUNCIL_QUORUM` | `3` | Min decisive votes before council settles; invalid values normalize to 3 (see `lib/council/quorum.ts`) |
+| `COUNCIL_QUORUM` | `3` | Min decisive votes before council settles; invalid values normalize to 3 (see `lib/council/quorum.ts`). Deduplication preserves the original vote's `arrivalId`: identical retries are idempotent, while conflicting duplicates are surfaced in `conflicts`. |
 | `COUNCIL_ALPHA` | `0.25` | Per-vote stop probability after quorum |
 | `COUNCIL_BONUS_USDC` | `0.01` | Total cross-entropy bonus pool per settlement; `0` pauses bonuses, maximum `1`, exact 7-decimal USDC |
 
@@ -223,6 +224,14 @@ quorum/confidence policies and reports which settlement decisions would change.
 It evaluates both policies on identical fixtures, makes no model-provider calls,
 and writes results only to a temporary state directory.
 
+---
+
+### Versioned council ballot commitment
+
+Before evaluating quorum or peer-reasoning outcomes, council ballots can be sealed with a versioned SHA-256 commitment (`COUNCIL_BALLOT_COMMITMENT_VERSION = 1` in `lib/council/quorum.ts` and `PEER_REASONING_COMMITMENT_VERSION = 1` in `agents/council/shared/peer-reasoning.ts`):
+
+- **Bound fields:** Canonical participant identities (persona slugs, optional case-sensitive wallet addresses, and jury track), `claimId`, `claimRevision`, the canonical `eligibleVoteSet`, the approved `votingBoundaryMs`, and the folded ballot snapshot.
+- **Boundary enforcement:** `createBallotCommitment`, `verifyBallotCommitment`, `evaluateQuorum`, and `buyPeerReasoning` reject any ballot or peer-reasoning read that is recorded or altered after `votingBoundaryMs`, comes from a persona outside `eligibleVoteSet`, mismatches a bound participant identity or `claimRevision`, or fails version/digest verification (`action: "abort_invalid_commitment"`).
 
 ---
 
@@ -262,6 +271,26 @@ Behaviour summary:
 - A persona that times out counts as abstaining, not as agreeing with the majority.
 - Abstentions do not lower the quorum threshold; `COUNCIL_QUORUM` still applies to substantive opinions only.
 - Existing configurations are unaffected unless `COUNCIL_DELIBERATION_DEADLINE_MS` is set to a non-zero value below the observed round duration.
+
+---
+
+## Quorum, equivocation, and outage resilience
+
+The settlement policy in `lib/council/quorum.ts` and peer reasoning in `agents/council/shared/peer-reasoning.ts` enforce conservative aggregation under Byzantine or degraded conditions:
+
+1. **Equivocation and conflicting votes:**
+   - If a persona attempts to submit conflicting votes (differing verdicts) for the same claim, `rejectEquivocation` treats this as Byzantine equivocation.
+   - Under conservative policy (`disqualify_all`), any persona that equivocates is disqualified: its prior vote is evicted from the ballot, decisive count is reduced, and both attempts are marked with disposition `equivocation`.
+   - Benign duplicate attempts with identical verdicts remain deduplicated (`duplicated`).
+
+2. **Expired ballots and delayed votes:**
+   - Individual vote attempts arriving past `ballotDeadlineMs` or exceeding `maxAgeMs` are classified as `expired` or `stale` and cannot pad quorum.
+   - If the ballot deadline elapses or `claimState === "expired"`, `evaluateQuorum` aborts with `abort_expired`. The oracle refuses to invent a stale consensus.
+
+3. **Partial provider outages:**
+   - If upstream LLM or HTTP provider failures (5xx, timeouts, connection drops) affect some personas, their votes are recorded as `dependency_failure` abstentions.
+   - If fewer than `COUNCIL_QUORUM` decisive votes remain, the council degrades conservatively to `fallback_solo` (oracle settles solo from independent evidence).
+   - In peer reasoning (`buyPeerReasoning`), provider outages are captured in `outages` and skipped cleanly so remaining available peers can still be consulted without hanging.
 
 ---
 
