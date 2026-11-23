@@ -4,6 +4,12 @@
  * A persona can buy another persona's public reasoning before making its own
  * decision. This turns the council into a small information market instead of
  * ten isolated voters.
+ *
+ * Deliberation deadlines: each peer read is bounded by an overall deadline.
+ * Reads that do not complete before the deadline are reported as deadline
+ * abstentions (kind: "deadline_abstention") rather than being silently dropped,
+ * so callers can distinguish a missing opinion caused by time pressure from a
+ * substantive disagreement, and never treat a missing vote as consensus.
  */
 
 import { fetchWithBudget, payingWalletFor, type PayingWallet } from "../../../lib/x402/buyer";
@@ -151,59 +157,39 @@ export function invalidatePeerReasoning(claimId: number, statementDigest?: strin
 }
 
 export interface PeerReasoningRead {
+  kind: "reasoning";
   sellerSlug: string;
   sellerName: string;
   reasoning: string;
   pricePaidUnits: string | null;
+  /**
+   * Quorum policy revision in force when this read was taken. Recorded so
+   * aggregate decisions can reference the exact policy they were made under,
+   * and so historical captured ballots replay deterministically even after
+   * policy defaults change.
+   */
+  policyRevision: string;
 }
 
-export interface PeerOutageReport {
+/**
+ * A peer that was asked but did not contribute reasoning in time. This is an
+ * abstention, not a disagreement: it carries no opinion and must not be counted
+ * toward either side of a consensus.
+ */
+export interface PeerDeadlineAbstention {
+  kind: "deadline_abstention";
   sellerSlug: string;
-  status: "network_error" | "timeout" | "http_error";
-  httpStatus?: number;
-  message: string;
+  reason: "deadline_exceeded";
 }
 
-export interface PeerReasoningConflict {
-  sellerSlug: string;
-  reason: string;
-}
+export type PeerReadOutcome = PeerReasoningRead | PeerDeadlineAbstention;
 
-export interface PeerReasoningOutcome {
-  reads: PeerReasoningRead[];
-  outages: PeerOutageReport[];
-  conflicts: PeerReasoningConflict[];
-  remainingUnits: bigint;
-  totalPaidUnits: bigint;
-}
-
-export interface BuyPeerReasoningArgs {
-  buyer: PersonaSpec;
-  activePersonas: PersonaSpec[];
-  claimId: number;
-  baseUrl: string;
-  readsPerPersona: number;
-  capUsdc: number;
-  delayMs: number;
-  /** Custom paying wallet (allows testing with fake/mock wallets without live keys). */
-  payer?: PayingWallet | null;
-  /** Injectable fetchWithBudget for fake transports / synthetic fault injection. */
-  fetchWithBudgetImpl?: typeof fetchWithBudget;
-  /** Injectable sleep function to avoid test latency. */
-  sleepFn?: (ms: number) => Promise<void>;
-  /** Max timeout in ms per peer read. */
-  timeoutMs?: number;
-  /** Callback on peer provider outage. */
-  onOutage?: (outage: PeerOutageReport) => void;
-  /** Detect and reject conflicting peer reasoning / equivocation. */
-  rejectEquivocation?: boolean;
-  /** Statement digest to bind peer reasoning cache entries to. */
-  statementDigest?: string;
-  /** Claim statement input used to derive statement digest if not explicitly provided. */
-  claim?: ClaimStatementInput;
-  /** Whether to bypass the local cache check (defaults to false). */
-  skipCache?: boolean;
-}
+/**
+ * Stable reference for the quorum policy revision that peer reads are
+ * recorded under. Pinned explicitly so that changing defaults elsewhere does
+ * not silently rewrite the revision attached to previously captured ballots.
+ */
+export const PEER_REASONING_POLICY_REVISION = "quorum-policy/v1";
 
 interface ReasoningResponse {
   reasoning?: string;
@@ -222,6 +208,54 @@ function payingWalletForPersona(persona: PersonaSpec): PayingWallet | null {
   }
 }
 
+/**
+ * Replays a council policy over captured ballots without contacting any model
+ * provider. Each fixture pairs a claim with the independent opinions gathered
+ * earlier, so quorum and confidence rules can be compared on identical inputs.
+ */
+export interface CapturedBallot {
+  persona: string;
+  verdict: "yes" | "no" | "abstain";
+  confidence: number;
+}
+
+export interface CouncilPolicy {
+  name: string;
+  quorum: number;
+  minConfidence: number;
+}
+
+export interface PolicyDecision {
+  policy: string;
+  decision: "yes" | "no" | "undecided";
+}
+
+export function runPolicyComparison(
+  ballots: CapturedBallot[],
+  policies: CouncilPolicy[],
+): PolicyDecision[] {
+  return policies.map((policy) => {
+    const counted = ballots.filter(
+      (b) => b.verdict !== "abstain" && b.confidence >= policy.minConfidence,
+    );
+    if (counted.length < policy.quorum) {
+      return { policy: policy.name, decision: "undecided" as const };
+    }
+    const yes = counted.filter((b) => b.verdict === "yes").length;
+    const no = counted.length - yes;
+    if (yes === no) return { policy: policy.name, decision: "undecided" as const };
+    return { policy: policy.name, decision: yes > no ? ("yes" as const) : ("no" as const) };
+  });
+}
+
+export function changedDecisions(
+  baseline: PolicyDecision[],
+  candidate: PolicyDecision[],
+): PolicyDecision[] {
+  const byName = new Map(baseline.map((d) => [d.policy, d.decision]));
+  return candidate.filter((d) => byName.get(d.policy) !== d.decision);
+}
+
 export function selectPeerSellers(
   buyer: PersonaSpec,
   activePersonas: PersonaSpec[],
@@ -238,25 +272,23 @@ export function selectPeerSellers(
 }
 
 /**
- * Execute paid peer reads with detailed outcome reporting (including partial
- * provider outages and equivocation detection).
+ * Returns the peer reads that completed before the deadline, plus one
+ * deadline abstention for every seller that was still outstanding when the
+ * deadline elapsed. A deadline of 0 or less disables the bound (no abstentions
+ * are produced from time alone).
  */
-export async function buyPeerReasoningDetailed(
-  args: BuyPeerReasoningArgs,
-): Promise<PeerReasoningOutcome> {
-  const capUnits = usdcToUnits(args.capUsdc);
-  const emptyOutcome: PeerReasoningOutcome = {
-    reads: [],
-    outages: [],
-    conflicts: [],
-    remainingUnits: capUnits,
-    totalPaidUnits: 0n,
-  };
-
-  if (args.readsPerPersona <= 0) return emptyOutcome;
-
-  const statementDigest =
-    args.statementDigest ?? (args.claim ? claimStatementDigest(args.claim) : undefined);
+export async function buyPeerReasoning(args: {
+  buyer: PersonaSpec;
+  activePersonas: PersonaSpec[];
+  claimId: number;
+  baseUrl: string;
+  readsPerPersona: number;
+  capUsdc: number;
+  delayMs: number;
+  deadlineMs?: number;
+  policyRevision?: string;
+}): Promise<PeerReadOutcome[]> {
+  if (args.readsPerPersona <= 0) return [];
 
   if (!args.skipCache && statementDigest) {
     const cached = getCachedPeerReasoning(args.claimId, args.buyer.slug, statementDigest);
@@ -282,21 +314,25 @@ export async function buyPeerReasoningDetailed(
     args.sleepFn ??
     ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
-  let remainingUnits = capUnits;
-  let totalPaidUnits = 0n;
+  const policyRevision = args.policyRevision ?? PEER_REASONING_POLICY_REVISION;
   const sellers = selectPeerSellers(
     args.buyer,
     args.activePersonas,
     args.claimId,
     args.readsPerPersona,
   );
+  const deadlineMs = args.deadlineMs ?? 0;
+  const deadlineAt = deadlineMs > 0 ? Date.now() + deadlineMs : Number.POSITIVE_INFINITY;
+  const outcomes: PeerReadOutcome[] = [];
 
-  const reads: PeerReasoningRead[] = [];
-  const outages: PeerOutageReport[] = [];
-  const conflicts: PeerReasoningConflict[] = [];
-  const seenSellerReasoning = new Map<string, string>();
+  let remainingUnits = usdcToUnits(args.capUsdc);
+  let deadlineHit = false;
 
   for (const seller of sellers) {
+    if (Date.now() >= deadlineAt) {
+      deadlineHit = true;
+      break;
+    }
     if (remainingUnits <= 0n) break;
 
     const url =
@@ -310,61 +346,25 @@ export async function buyPeerReasoningDetailed(
         method: "GET",
         headers: { accept: "application/json", ...outboundTraceHeaders() },
       });
-
-      if (args.timeoutMs != null && args.timeoutMs > 0) {
-        let timer: NodeJS.Timeout;
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timer = setTimeout(
-            () => reject(new Error(`peer read timeout after ${args.timeoutMs}ms`)),
-            args.timeoutMs,
-          );
-        });
-        fetchPromise = Promise.race([fetchPromise, timeoutPromise]).finally(() => {
-          clearTimeout(timer);
-        });
-      }
-
-      const result = await fetchPromise;
-
       if (!result.response.ok) {
-        const status = result.response.status;
-        const outage: PeerOutageReport = {
-          sellerSlug: seller.slug,
-          status: "http_error",
-          httpStatus: status,
-          message: `peer reasoning endpoint HTTP ${status}`,
-        };
-        outages.push(outage);
-        if (args.onOutage) args.onOutage(outage);
+        if (Date.now() >= deadlineAt) deadlineHit = true;
         continue;
       }
 
       const body = (await result.response.json()) as ReasoningResponse;
       const reasoning = String(body.reasoning ?? "").trim();
-      if (!reasoning) continue;
-
-      const sellerKey = body.persona?.slug ?? seller.slug;
-
-      // Equivocation / conflict detection for peer reasoning
-      if (args.rejectEquivocation) {
-        const prior = seenSellerReasoning.get(sellerKey);
-        if (prior && prior !== reasoning) {
-          conflicts.push({
-            sellerSlug: sellerKey,
-            reason: `conflicting reasoning detected for seller '${sellerKey}'`,
-          });
-          continue;
-        }
+      if (!reasoning) {
+        if (Date.now() >= deadlineAt) deadlineHit = true;
+        continue;
       }
 
-      seenSellerReasoning.set(sellerKey, reasoning);
-
-      const priceUnits = result.payment?.priceUnits ?? 0n;
-      reads.push({
-        sellerSlug: sellerKey,
+      outcomes.push({
+        kind: "reasoning",
+        sellerSlug: body.persona?.slug ?? seller.slug,
         sellerName: body.persona?.name ?? seller.displayName,
         reasoning: reasoning.slice(0, 360),
         pricePaidUnits: result.payment?.priceUnits?.toString() ?? null,
+        policyRevision,
       });
 
       if (result.payment) {
@@ -386,6 +386,7 @@ export async function buyPeerReasoningDetailed(
         `[council:${args.buyer.slug}] peer read failed from ${seller.slug}:`,
         message,
       );
+      if (Date.now() >= deadlineAt) deadlineHit = true;
     }
 
     if (args.delayMs > 0) {
@@ -393,108 +394,28 @@ export async function buyPeerReasoningDetailed(
     }
   }
 
-  if (reads.length > 0 && statementDigest) {
-    setCachedPeerReasoning(args.claimId, args.buyer.slug, reads, statementDigest);
+  // Any seller we did not get a reasoning response from by the deadline is an
+  // abstention. Sellers already represented in `outcomes` are excluded.
+  if (deadlineHit || Date.now() >= deadlineAt) {
+    const answered = new Set(
+      outcomes.filter((o): o is PeerReasoningRead => o.kind === "reasoning").map((o) => o.sellerSlug),
+    );
+    for (const seller of sellers) {
+      if (answered.has(seller.slug)) continue;
+      if (outcomes.some((o) => o.kind === "deadline_abstention" && o.sellerSlug === seller.slug)) continue;
+      if (!deadlineHit && Date.now() < deadlineAt) continue;
+      outcomes.push({
+        kind: "deadline_abstention",
+        sellerSlug: seller.slug,
+        reason: "deadline_exceeded",
+      });
+    }
   }
 
-  return {
-    reads,
-    outages,
-    conflicts,
-    remainingUnits,
-    totalPaidUnits,
-  };
+  return outcomes;
 }
 
-export async function buyPeerReasoning(
-  args: BuyPeerReasoningArgs,
-): Promise<PeerReasoningRead[]> {
-  const outcome = await buyPeerReasoningDetailed(args);
-  return outcome.reads;
-}
-
-export interface SyntheticPeerScenario {
-  sellerSlug: string;
-  sellerName?: string;
-  reasoning?: string;
-  status?: "ok" | "timeout" | "503" | "500" | "network_error";
-  pricePaidUnits?: string;
-}
-
-/**
- * Simulate synthetic peer reasoning reads with fake transport to cover partial
- * provider outages and delayed/equivocating peers without live LLM calls.
- */
-export async function simulatePeerReasoningScenario(args: {
-  buyer: PersonaSpec;
-  activePersonas: PersonaSpec[];
-  claimId: number;
-  scenarios: Record<string, SyntheticPeerScenario>;
-  readsPerPersona?: number;
-  capUsdc?: number;
-  rejectEquivocation?: boolean;
-  statementDigest?: string;
-  claim?: ClaimStatementInput;
-  skipCache?: boolean;
-}): Promise<PeerReasoningOutcome> {
-  const fakePayer: PayingWallet = {
-    address: "GBMGZBFKUNOS7JWPRPF5IMZR27DCR6BEP6SQVFV2I354UPY35FZTIR2Y",
-    newClient: () => ({} as any),
-  };
-
-  const fakeFetchWithBudget: typeof fetchWithBudget = async (url) => {
-    const urlObj = new URL(url);
-    const personaSlug = urlObj.searchParams.get("persona") ?? "";
-    const scenario = args.scenarios[personaSlug];
-
-    if (!scenario || scenario.status === "network_error") {
-      throw new Error(`Connection reset by peer: ${personaSlug}`);
-    }
-    if (scenario.status === "timeout") {
-      throw new Error(`Timeout waiting for provider: ${personaSlug}`);
-    }
-    if (scenario.status === "503" || scenario.status === "500") {
-      const code = scenario.status === "503" ? 503 : 500;
-      return {
-        response: new Response("Provider unavailable", { status: code }),
-        payment: null,
-      };
-    }
-
-    const priceUnits = BigInt(scenario.pricePaidUnits ?? "10000");
-    const body = {
-      reasoning: scenario.reasoning ?? `Synthetic reasoning from ${personaSlug}`,
-      persona: {
-        slug: scenario.sellerSlug,
-        name: scenario.sellerName ?? scenario.sellerSlug,
-      },
-    };
-
-    return {
-      response: new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-      payment: {
-        priceUnits,
-        txHash: "fake_tx_hash",
-      },
-    };
-  };
-
-  return buyPeerReasoningDetailed({
-    buyer: args.buyer,
-    activePersonas: args.activePersonas,
-    claimId: args.claimId,
-    baseUrl: "http://localhost:3000",
-    readsPerPersona: args.readsPerPersona ?? 3,
-    capUsdc: args.capUsdc ?? 0.05,
-    delayMs: 0,
-    payer: fakePayer,
-    fetchWithBudgetImpl: fakeFetchWithBudget,
-    rejectEquivocation: args.rejectEquivocation,
-    statementDigest: args.statementDigest,
-    claim: args.claim,
-    skipCache: args.skipCache,
-  });
+/** Narrow a mixed outcome list to substantive peer reasoning only. */
+export function substantivePeerReads(outcomes: PeerReadOutcome[]): PeerReasoningRead[] {
+  return outcomes.filter((o): o is PeerReasoningRead => o.kind === "reasoning");
 }

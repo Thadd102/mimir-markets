@@ -1,5 +1,5 @@
 /**
- * Council quorum + fallback rules for settlement (äagents / RFB council boundary).
+ * Council quorum + fallback rules for settlement (agents / RFB council boundary).
  *
  * `gatherCouncilVerdict` buys persona votes and tallies them. This module is the
  * pure policy layer that decides whether that tally is allowed to settle a claim,
@@ -11,6 +11,13 @@
  * failures degrade to solo oracle settlement rather than inventing a majority.
  *
  * Pure: no I/O. Callers classify each attempt, then ask {@link evaluateQuorum}.
+ *
+ * Policy revision: every evaluation carries `policyRevision`, a stable reference
+ * identifying the rule set that produced the decision. It is derived from the
+ * policy's *effective* parameters (quorum after normalization), not from the
+ * default constants themselves, so changing a default in a future release does
+ * not silently rewrite the reference recorded for historical ballots. Replaying
+ * a captured ballot under a pinned revision yields the identical decision.
  */
 
 import { isVerdict, type Verdict } from "../verdict";
@@ -41,8 +48,12 @@ export type VoteDisposition =
   | "cancelled"
   | "paused"
   | "dependency_failure"
-  | "equivocation"
-  | "expired";
+  /**
+   * Persona did not vote before the council deliberation deadline. Counted as
+   * abstention (never as a decisive or DRAW vote) so missing votes cannot be
+   * mistaken for consensus.
+   */
+  | "deadline_abstention";
 
 export type FallbackAction =
   /** Decisive votes met quorum — use the council tally. */
@@ -58,7 +69,9 @@ export type FallbackAction =
   /** Ballot or settlement window has expired — council settlement aborted. */
   | "abort_expired"
   /** Quorum config is unusable after normalization refusal. */
-  | "abort_invalid_config";
+  | "abort_invalid_config"
+  /** Deadline passed with too few decisive votes — oracle settles solo, never by default consensus. */
+  | "fallback_deadline";
 
 export interface QuorumConfig {
   /**
@@ -73,6 +86,22 @@ export const DEFAULT_COUNCIL_QUORUM = 3;
 
 /** Hard ceiling so a typo cannot demand more jurors than exist. */
 export const MAX_COUNCIL_QUORUM = 20;
+
+/**
+ * Stable identifier for the quorum rule set. Bump the leading version only when
+ * the decision semantics change (not when defaults are tuned). The effective
+ * quorum is appended so the reference pins the parameter actually applied.
+ */
+export const QUORUM_POLICY_ID = "council-quorum/v1";
+
+/**
+ * Build the policy revision reference for an effective (normalized) quorum.
+ * Depends only on the effective parameter, so a default change that does not
+ * alter the effective value keeps prior references valid.
+ */
+export function policyRevisionFor(effectiveQuorum: number): string {
+  return `${QUORUM_POLICY_ID}:q=${effectiveQuorum}`;
+}
 
 export interface VoteAttemptInput {
   slug: string;
@@ -120,6 +149,8 @@ export interface ClassifiedVote {
 export interface QuorumEvaluation {
   action: FallbackAction;
   quorum: number;
+  /** Stable reference to the rule set (and effective quorum) that produced this decision. */
+  policyRevision: string;
   decisiveCount: number;
   acceptedCount: number;
   dispositions: Record<VoteDisposition, number>;
@@ -137,9 +168,79 @@ const EMPTY_DISPOSITIONS = (): Record<VoteDisposition, number> => ({
   cancelled: 0,
   paused: 0,
   dependency_failure: 0,
-  equivocation: 0,
-  expired: 0,
+  deadline_abstention: 0,
 });
+
+/**
+ * Classify a persona that produced no response before the deliberation deadline.
+ * This is an explicit abstention, distinct from a substantive DRAW / UNRESOLVABLE
+ * verdict and from a dependency failure.
+ */
+export function classifyDeadlineAbstention(slug: string): ClassifiedVote {
+  return {
+    slug: (slug ?? "").trim().toLowerCase(),
+    disposition: "deadline_abstention",
+    reason: "no vote before council deliberation deadline",
+    decisive: false,
+  };
+}
+
+/**
+ * Compare quorum/confidence policy outcomes across identical fixtures without
+ * contacting model providers. Each fixture is a list of raw vote attempts plus
+ * a quorum config; the result reports the evaluation under a baseline policy and
+ * a candidate policy, and flags any decisions that changed.
+ */
+export interface PolicyFixture {
+  name: string;
+  attempts: ClassifiedVote[];
+  quorum: unknown;
+  claimState?: ClaimSettleState;
+}
+
+export interface PolicyComparisonRow {
+  name: string;
+  baseline: FallbackAction;
+  candidate: FallbackAction;
+  changed: boolean;
+  baselineReason: string;
+  candidateReason: string;
+}
+
+export interface PolicyComparisonReport {
+  rows: PolicyComparisonRow[];
+  changedCount: number;
+}
+
+/**
+ * Run two quorum policies over the same fixtures and report changed decisions.
+ * Pure: no network, no provider calls, no persisted state.
+ */
+export function comparePolicies(
+  fixtures: PolicyFixture[],
+  baselineOpts: { quorum?: unknown; strictConfig?: boolean } = {},
+  candidateOpts: { quorum?: unknown; strictConfig?: boolean } = {},
+): PolicyComparisonReport {
+  const rows: PolicyComparisonRow[] = fixtures.map((fx) => {
+    const base = evaluateQuorum(fx.attempts, baselineOpts.quorum ?? fx.quorum, {
+      claimState: fx.claimState,
+      strictConfig: baselineOpts.strictConfig,
+    });
+    const cand = evaluateQuorum(fx.attempts, candidateOpts.quorum ?? fx.quorum, {
+      claimState: fx.claimState,
+      strictConfig: candidateOpts.strictConfig,
+    });
+    return {
+      name: fx.name,
+      baseline: base.action,
+      candidate: cand.action,
+      changed: base.action !== cand.action,
+      baselineReason: base.reason,
+      candidateReason: cand.reason,
+    };
+  });
+  return { rows, changedCount: rows.filter((r) => r.changed).length };
+}
 
 export function isDecisiveVerdict(verdict: Verdict): boolean {
   return verdict === "CREATOR_WINS" || verdict === "CHALLENGERS_WIN";
@@ -148,7 +249,7 @@ export function isDecisiveVerdict(verdict: Verdict): boolean {
 /**
  * Normalize a raw quorum (env Number, caller override, …).
  *
- * Invalid values (NaN, non-finite, &lt; 1) become the default so a typo cannot
+ * Invalid values (NaN, non-finite, < 1) become the default so a typo cannot
  * silently disable the gate (`quorum: 0` would otherwise accept an empty jury).
  * Values above {@link MAX_COUNCIL_QUORUM} clamp rather than reject — demanding
  * more jurors than the roster has is a config smell, not a settle-time abort.
@@ -489,6 +590,10 @@ export interface QuorumEvaluationOptions extends BuildBallotOptions {
 /**
  * Decide whether the council ballot may settle the claim, or how to fall back.
  *
+ * Every returned evaluation carries `policyRevision`, derived from the effective
+ * quorum, so a recorded decision can be replayed deterministically under the
+ * same revision.
+ *
  * @param strictConfig — when set and {@link isInvalidQuorumConfig} is true,
  *   returns `abort_invalid_config` instead of normalizing.
  */
@@ -498,11 +603,14 @@ export function evaluateQuorum(
   opts?: QuorumEvaluationOptions,
 ): QuorumEvaluation {
   const claimState = opts?.claimState;
+  const quorum = normalizeQuorum(quorumRaw);
+  const policyRevision = policyRevisionFor(quorum);
 
   if (claimState === "cancelled") {
     return {
       action: "abort_cancelled",
-      quorum: normalizeQuorum(quorumRaw),
+      quorum,
+      policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
@@ -515,7 +623,8 @@ export function evaluateQuorum(
   if (claimState === "resolved") {
     return {
       action: "abort_resolved",
-      quorum: normalizeQuorum(quorumRaw),
+      quorum,
+      policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
@@ -528,7 +637,8 @@ export function evaluateQuorum(
   if (claimState === "paused") {
     return {
       action: "abort_paused",
-      quorum: normalizeQuorum(quorumRaw),
+      quorum,
+      policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
@@ -564,6 +674,7 @@ export function evaluateQuorum(
     return {
       action: "abort_invalid_config",
       quorum: 0,
+      policyRevision: policyRevisionFor(0),
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
@@ -573,25 +684,13 @@ export function evaluateQuorum(
     };
   }
 
-  const quorum = normalizeQuorum(quorumRaw);
-  const { ballot, rejected } = buildBallot(attempts, opts);
+  const { ballot, rejected } = buildBallot(attempts);
   const all = [...ballot, ...rejected];
   const dispositions = countDispositions(all);
-  const decisiveCount = ballot.filter((v) => v.decisive).length;
-  const acceptedSlugs = ballot.map((v) => v.slug);
-
-  if (decisiveCount >= quorum) {
-    return {
-      action: "use_council",
-      quorum,
-      decisiveCount,
-      acceptedCount: ballot.length,
-      dispositions,
-      reason: `quorum met: ${decisiveCount} decisive ≥ ${quorum}`,
-      acceptedSlugs,
-      ballot,
-    };
-  }
+  const decisive = ballot.filter((vote) => vote.decisive);
+  const decisiveCount = decisive.length;
+  const acceptedSlugs = ballot.map((vote) => vote.slug);
+  const met = decisiveCount >= quorum;
 
   const dep = dispositions.dependency_failure;
   const paused = dispositions.paused;
@@ -610,191 +709,16 @@ export function evaluateQuorum(
   ].filter(Boolean);
 
   return {
-    action: "fallback_solo",
+    action: met ? "use_council" : "fallback_solo",
     quorum,
+    policyRevision,
     decisiveCount,
     acceptedCount: ballot.length,
     dispositions,
-    reason: reasonParts.join("; "),
+    reason: met
+      ? `quorum met: ${decisiveCount}/${quorum} decisive votes`
+      : `below quorum: ${decisiveCount}/${quorum} decisive votes — solo fallback`,
     acceptedSlugs,
     ballot,
   };
 }
-
-/** True when the oracle should settle with its own evidence (not abort). */
-export function shouldFallbackSolo(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "fallback_solo";
-}
-
-/** True when council tally is authoritative for this settlement. */
-export function shouldUseCouncil(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "use_council";
-}
-
-/** True when council settlement aborted due to ballot or deadline expiration. */
-export function isExpiredQuorumEvaluation(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "abort_expired";
-}
-
-/** True when vote attempt was classified or rejected as equivocation. */
-export function isEquivocatedVote(vote: ClassifiedVote): boolean {
-  return vote.disposition === "equivocation";
-}
-
-export interface SyntheticScenarioInput {
-  slug: string;
-  verdict?: Verdict | "error" | "timeout" | "delayed";
-  confidence?: number;
-  equivocateWith?: Verdict;
-  delayedByMs?: number;
-  maxAgeMs?: number;
-  httpStatus?: number;
-}
-
-/**
- * Simulate a council voting scenario covering equivocation, delayed votes,
- * and partial provider outages without making any live network or LLM calls.
- */
-export function simulateCouncilScenario(
-  scenarios: SyntheticScenarioInput[],
-  quorumRaw: unknown = DEFAULT_COUNCIL_QUORUM,
-  opts?: QuorumEvaluationOptions,
-): QuorumEvaluation {
-  const attempts: ClassifiedVote[] = [];
-
-  for (const s of scenarios) {
-    if (s.verdict === "error") {
-      attempts.push(
-        classifyVoteAttempt({
-          slug: s.slug,
-          claimId: 42,
-          expectedClaimId: 42,
-          claimState: opts?.claimState ?? "active",
-          status: "http_error",
-          httpStatus: s.httpStatus ?? 503,
-        }),
-      );
-      continue;
-    }
-
-    if (s.verdict === "timeout") {
-      attempts.push(
-        classifyVoteAttempt({
-          slug: s.slug,
-          claimId: 42,
-          expectedClaimId: 42,
-          claimState: opts?.claimState ?? "active",
-          status: "timeout",
-        }),
-      );
-      continue;
-    }
-
-    const isDelayed =
-      s.verdict === "delayed" ||
-      (s.delayedByMs != null && s.maxAgeMs != null && s.delayedByMs > s.maxAgeMs);
-
-    const voteAttempt: VoteAttemptInput = {
-      slug: s.slug,
-      claimId: 42,
-      expectedClaimId: 42,
-      claimState: opts?.claimState ?? "active",
-      status: "ok",
-      verdict: s.verdict === "delayed" ? "CREATOR_WINS" : s.verdict ?? "CREATOR_WINS",
-      confidence: s.confidence ?? 80,
-      ageMs: s.delayedByMs,
-      maxAgeMs: s.maxAgeMs,
-      expired: isDelayed,
-    };
-    attempts.push(classifyVoteAttempt(voteAttempt));
-
-    if (s.equivocateWith) {
-      attempts.push(
-        classifyVoteAttempt({
-          slug: s.slug,
-          claimId: 42,
-          expectedClaimId: 42,
-          claimState: opts?.claimState ?? "active",
-          status: "ok",
-          verdict: s.equivocateWith,
-          confidence: s.confidence ?? 80,
-        }),
-      );
-    }
-  }
-
-  return evaluateQuorum(attempts, quorumRaw, opts);
-}
-
-/** Minimal shape of a claim as read from chain for joinability selection. */
-export interface JoinableClaimInput {
-  id: number;
-  /** Claim lifecycle state as reported by the contract. */
-  state?: ClaimSettleState | string;
-  /** Unix seconds deadline for joining, when known. */
-  joinDeadline?: number | bigint | null;
-  /** Unix seconds when the claim was created, when known. */
-  createdAt?: number | bigint | null;
-  /** True when the claim has already been settled/resolved. */
-  resolved?: boolean;
-  /** True when the claim has been cancelled. */
-  cancelled?: boolean;
-  /** True when the claim is paused. */
-  paused?: boolean;
-  /** Number of jurors already on the claim, when known. */
-  jurCount?: number;
-  /** Maximum jurors allowed on the claim, when known. */
-  maxJurors?: number;
-}
-
-const TERMINAL_STATES = new Set<string>(["cancelled", "resolved"]);
-
-function toSeconds(value: number | bigint | null | undefined): number | null {
-  if (value == null || value === undefined) return null;
-  if (typeof value === "bigint") {
-    const n = Number(value);
-    return Number.isFinite(n) ? n : null;
-  }
-  return Number.isFinite(value) ? value : null;
-}
-
-/**
- * Select claims that are still joinable at `totalSeconds`: open/active,
- * not cancelled/resolved/paused, join deadline not yet passed, and juror
- * slots remaining. Pure so the poll loop can delegate the filter to it and
- * tests can exercise it without a chain.
- *
- * @param claims — batched reads from `readClaimsBatch`
- * @param now — current time in Unix seconds (matches contract timestamps)
- */
-export function selectJoinableClaims(
-  claims: readonly JoinableClaimInput[],
-  now: number,
-): JoinableClaimInput[] {
-  if (!Number.isFinite(now)) return [];
-  const out: JoinableClaimInput[] = [];
-  for (const claim of claims) {
-    if (!claim || !Number.isInteger(claim.id) || claim.id < 1) continue;
-    if (claim.resolved || claim.cancelled || claim.paused) continue;
-    if (claim.state != null && TERMINAL_STATES.has(String(claim.state).toLowerCase())) continue;
-    if (claim.state != null && String(claim.state).toLowerCase() === "paused") continue;
-
-    const deadline = toSeconds(claim.joinDeadline);
-    if (deadline != null && deadline > 0 && now >= deadline) continue;
-
-    if (
-      claim.maxJurors != null &&
-      Number.isFinite(claim.maxJurors) &&
-      claim.jurCount != null &&
-      Number.isFinite(claim.jurCount) &&
-      claim.jurCount >= claim.maxJurors
-    ) {
-      continue;
-    }
-
-    out.push(claim);
-  }
-  return out;
-}
-
-
