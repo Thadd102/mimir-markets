@@ -2,10 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  BALLOT_COMMITMENT_VERSION,
+  BallotCommitmentError,
+  COUNCIL_BALLOT_COMMITMENT_VERSION,
   DEFAULT_COUNCIL_QUORUM,
   MAX_COUNCIL_QUORUM,
   buildBallot,
+  canonicalBallotCommitmentPayload,
   classifyVoteAttempt,
+  commitCouncilBallot,
+  createBallotCommitment,
   evaluateQuorum,
   isDecisiveVerdict,
   isEquivocatedVote,
