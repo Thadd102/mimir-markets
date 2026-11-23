@@ -203,6 +203,26 @@ Keep the `council_bonus_payouts` table for audit and manual reconciliation.
 No schema migration or contract redeploy is needed for the funded market
 state; the new table is created by the existing database bootstrap.
 
+### Quorum policy revision
+
+Every aggregate council decision records the quorum policy revision under
+which it was computed. The revision is a stable reference to the quorum
+policy (its threshold and normalization rules) and does not change when
+policy defaults are edited, so historical decisions remain interpretable.
+Replaying captured ballots against the recorded revision reproduces the
+original result deterministically; ballots are never re-scored under a
+newer policy default.
+
+---
+
+## Council policy comparison runner
+
+The policy comparison runner replays **captured council ballots** against two
+quorum/confidence policies and reports which settlement decisions would change.
+It evaluates both policies on identical fixtures, makes no model-provider calls,
+and writes results only to a temporary state directory.
+
+
 ---
 
 ## Rate-limit strategy
@@ -223,18 +243,24 @@ The market-creator can buy council opinions before opening a market via `POST /a
 
 When `COUNCIL_PEER_READS=1`, each buyer persona pays selected seller personas through `GET /api/council/reasoning`, so revenue lands directly in the seller persona's wallet and appears on `/revenue`.
 
-### Peer reasoning cache binding to claim statement digest
+### Bounded deliberation deadlines
 
-Peer reasoning cache entries are cryptographically bound to the claim's statement digest (`claimStatementDigest`):
+Each council deliberation runs against a bounded deadline. A persona whose vote, peer read, or LLM call has not completed before the deadline is recorded as **deadline abstention**, which is distinct from **substantive disagreement**:
 
-1. **Statement wording & source commitment:**
-   - The digest hashes the statement wording (`question`, `creatorPosition`, `counterPosition`) and source commitments (`resolutionUrl`, `settlementRule`, `contextHash`).
-   - Any change to wording or resolution source produces a new digest, invalidating existing cache entries and triggering fresh reasoning without serving stale rationale.
-2. **Independent claim caching:**
-   - Cache entries are keyed by `${claimId}:${buyerSlug}:${statementDigest}` (in agent memory) and `${claimId}:${slug}:${statementDigest}` (in the `/api/council/reasoning` endpoint cache).
-   - Invalidation for one claim never bleeds into or invalidates entries for unrelated claims.
-3. **Quorum verification (`lib/council/quorum.ts`):**
-   - Quorum evaluation checks `VoteAttemptInput.statementDigest` against `expectedStatementDigest`. If wording or commitments change between vote generation and tally, the attempt is classified as `stale`, preventing quorum settlement on mismatched statements.
+- **Deadline abstention** means the persona produced no usable opinion in time. It is excluded from quorum counts and never contributes a CREATOR_WINS or CHALLENGERS_WIN vote.
+- **Substantive disagreement** means the persona returned an explicit verdict (including `UNRESOLVABLE`) that disagrees with the rest of the council. It counts toward quorum like any other decisive or non-decisive report.
+
+Missing votes are never converted into consensus. If the number of substantive opinions is below `COUNCIL_QUORUM`, the council does not settle on the strength of the remaining votes, and the claim is left for the oracle's independent resolution path. Deadline abstentions are logged as `council-<slug>-<claimId>` with status `deadline_abstain` so operators can distinguish timeouts from genuine disagreement in audits.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COUNCIL_DELIBERATION_DEADLINE_MS` | `120000` | Max ms a deliberation round may run before outstanding personas are recorded as deadline abstentions. `0` disables the deadline. |
+
+Behaviour summary:
+
+- A persona that times out counts as abstaining, not as agreeing with the majority.
+- Abstentions do not lower the quorum threshold; `COUNCIL_QUORUM` still applies to substantive opinions only.
+- Existing configurations are unaffected unless `COUNCIL_DELIBERATION_DEADLINE_MS` is set to a non-zero value below the observed round duration.
 
 ---
 
