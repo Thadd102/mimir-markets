@@ -4,12 +4,15 @@
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
 
 use crate::admin;
+use crate::claim_history;
 use crate::claims;
 use crate::escrow;
+use crate::fees;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, CreateParams, Error, FeePolicy,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimHistoryPage, ClaimPreflight,
+    CreateParams, Error, FeePolicy,
     MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict,
     WinnerSide, MAX_BATCH_SIZE,
 };
@@ -193,6 +196,30 @@ impl MimirMarket {
         storage::get_claim(&env, claim_id)
     }
 
+    /// Canonical statement for independent client verification.
+    ///
+    /// Returns the public question, the immutable `context_hash` as
+    /// `source_commitment`, the deadline, and a v1 SHA-256 digest over exactly
+    /// those inputs. See `util::claim_statement_digest` for the byte encoding.
+    /// The statement is stable for the life of the claim, including after
+    /// challenge, resolution, or cancellation. Unknown ids fail with
+    /// `Error::ClaimNotFound`.
+    pub fn get_claim_statement(env: Env, claim_id: u64) -> Result<ClaimStatement, Error> {
+        claims::get_claim_statement(&env, claim_id)
+    }
+
+    /// Alias of `get_claim_statement`, named for callers that export a
+    /// statement to an indexer or worker.
+    pub fn export_claim_statement(env: Env, claim_id: u64) -> Result<ClaimStatement, Error> {
+        claims::get_claim_statement(&env, claim_id)
+    }
+
+    /// Digest-only view for callers that need just the canonical v1 digest
+    /// without marshalling the full statement.
+    pub fn get_claim_statement_digest(env: Env, claim_id: u64) -> Result<BytesN<32>, Error> {
+        Ok(claims::get_claim_statement(&env, claim_id)?.digest)
+    }
+
     /// Paginated list of claim ids created by `creator`, in creation order.
     ///
     /// Returns up to `limit` ids starting at `offset` (0-based) together with
@@ -212,7 +239,35 @@ impl MimirMarket {
         if !storage::is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
-        Ok(storage::creator_claims_page(&env, &creator, offset, limit))
+        let (ids, total) = storage::get_creator_claims(&env, &creator, offset, limit);
+        Ok((ids, total.min(u32::MAX as u64) as u32))
+    }
+
+    /// One bounded page of a claim's transition history (#781), oldest first.
+    ///
+    /// Each transition carries its stable identity `(claim_id, seq)`; `seq`
+    /// starts at 1 and is never reused, so a reference stays valid as new
+    /// transitions are appended. Returns transitions with `seq > cursor`
+    /// (`cursor = 0` for the first page; then the previous `next_cursor`).
+    ///
+    /// Bounded: at most `MAX_HISTORY_PAGE_SIZE` (50) entries per call;
+    /// `limit = 0` means that maximum and a larger `limit` is refused with
+    /// `Error::HistoryPageTooLarge` before any storage read. The read opens one
+    /// entry per returned transition plus the claim's history head and never
+    /// the challenger roster, so its cost is O(page), not O(challengers).
+    ///
+    /// Incomplete history is explicit: `next_cursor` is `Some` while later
+    /// transitions exist, `from_genesis == false` means transitions before
+    /// seq 1 were never recorded on chain (claim predates history tracking),
+    /// and `missing_seq` names an archived entry the page stopped at.
+    /// Unknown claim ids return `Error::ClaimNotFound`.
+    pub fn get_claim_history(
+        env: Env,
+        claim_id: u64,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<ClaimHistoryPage, Error> {
+        claim_history::get_page(&env, claim_id, cursor, limit)
     }
 
     /// The claim's verdict with its explicit encoding version.
@@ -386,6 +441,14 @@ impl MimirMarket {
         storage::fee_policy(&env)
     }
 
+    /// Bounded fee-policy compatibility query for generated clients.
+    ///
+    /// Pure read returning supported policy fields, hard caps, timelock,
+    /// USDC escrow scale, rounding semantics, and current/pending policy state.
+    pub fn get_fee_policy_compatibility(env: Env) -> Result<FeePolicyCompatibility, Error> {
+        fees::fee_policy_compatibility(&env)
+    }
+
     pub fn get_pending_fee_policy(env: Env) -> Option<PendingFeePolicy> {
         storage::pending_fee_policy(&env)
     }
@@ -410,7 +473,24 @@ impl MimirMarket {
         storage::withdrawable(&env, &who)
     }
 
+    /// Batched withdrawable balances, position-stable with `addrs`.
+    ///
+    /// Refuses the whole call with `Error::BatchTooLarge` above
+    /// `MAX_BATCH_SIZE`; unknown addresses return `0` in their slot.
+    pub fn get_withdrawable_batch(env: Env, addrs: Vec<Address>) -> Result<Vec<i128>, Error> {
+        storage::get_withdrawable_batch(&env, addrs)
+    }
+
     pub fn get_accrued_fees(env: Env, who: Address) -> i128 {
         storage::accrued_fees(&env, &who)
+    }
+
+    /// Read-only descriptor of the currently approved oracle resolution and
+    /// claim expiration policy enforced by `claims` and `resolve`.
+    ///
+    /// Pure read: requires no auth, touches no storage, moves no USDC, and
+    /// preserves oracle-only resolution and existing withdrawal rights.
+    pub fn get_resolution_expiration_policy(_env: Env) -> ResolutionExpirationPolicy {
+        resolve::resolution_expiration_policy()
     }
 }

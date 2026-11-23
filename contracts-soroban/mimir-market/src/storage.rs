@@ -6,8 +6,8 @@
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 use crate::types::{
-    Challenger, ChallengerPage, Claim, Error, FeePolicy, PendingFeePolicy, PendingOracle,
-    RematchStatus, Verdict,
+    Challenger, ChallengerPage, Claim, ClaimHistoryHead, ClaimTransition, Error, FeePolicy,
+    PendingFeePolicy, PendingOracle, RematchStatus, Verdict,
 };
 
 /// Maximum number of addresses accepted by [`get_withdrawable_batch`].
@@ -34,6 +34,10 @@ pub enum DataKey {
     Usdc,
     Policy,
     Pending,
+    /// Active fee-policy revision when the current pending policy was queued.
+    /// Kept separate from `PendingFeePolicy` so adding this guard does not
+    /// change the serialized shape of an already queued policy.
+    PendingPolicyBaseRevision,
     /// Queued oracle rotation (separate from fee-policy Pending).
     PendingOracle,
     ClaimCount,
@@ -56,6 +60,13 @@ pub enum DataKey {
     CreatorClaims(Address, u32),
     /// Per-creator total claim count, used to derive the page layout.
     CreatorClaimCount(Address),
+    /// Per-claim transition history head: newest sequence number and whether
+    /// recording started at creation. See `claim_history`.
+    ClaimHistoryHead(u64),
+    /// One recorded claim transition, keyed by its stable identity
+    /// `(claim_id, seq)`. One entry per transition keeps a history read
+    /// O(page) instead of O(challengers).
+    ClaimHistoryEntry(u64, u32),
 }
 
 /// Persistent entries are bumped to roughly 30 days of ledgers on touch so an
@@ -133,6 +144,10 @@ pub fn set_fee_policy(env: &Env, policy: &FeePolicy) {
     env.storage().instance().set(&DataKey::Policy, policy);
 }
 
+pub fn fee_policy_revision(env: &Env) -> Result<u64, Error> {
+    Ok(fee_policy(env)?.revision)
+}
+
 pub fn pending_fee_policy(env: &Env) -> Option<PendingFeePolicy> {
     env.storage().instance().get(&DataKey::Pending)
 }
@@ -141,8 +156,23 @@ pub fn set_pending_fee_policy(env: &Env, pending: &PendingFeePolicy) {
     env.storage().instance().set(&DataKey::Pending, pending);
 }
 
+pub fn pending_fee_policy_base_revision(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PendingPolicyBaseRevision)
+}
+
+pub fn set_pending_fee_policy_base_revision(env: &Env, revision: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingPolicyBaseRevision, &revision);
+}
+
 pub fn clear_pending_fee_policy(env: &Env) {
     env.storage().instance().remove(&DataKey::Pending);
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingPolicyBaseRevision);
 }
 
 pub fn pending_oracle(env: &Env) -> Option<PendingOracle> {
@@ -238,6 +268,11 @@ pub fn get_claim_opt(env: &Env, id: u64) -> Option<Claim> {
         }
         None => None,
     }
+}
+
+/// Whether a claim entry exists, without deserializing it or bumping its TTL.
+pub fn has_claim(env: &Env, id: u64) -> bool {
+    env.storage().persistent().has(&DataKey::Claim(id))
 }
 
 pub fn set_claim(env: &Env, id: u64, claim: &Claim) {
@@ -403,6 +438,48 @@ pub fn get_creator_claims(
     }
 
     (out, total)
+}
+
+// ── Claim transition history ─────────────────────────────────────────────────
+
+pub fn claim_history_head(env: &Env, id: u64) -> Option<ClaimHistoryHead> {
+    let key = DataKey::ClaimHistoryHead(id);
+    let head: Option<ClaimHistoryHead> = env.storage().persistent().get(&key);
+    if head.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+    }
+    head
+}
+
+pub fn set_claim_history_head(env: &Env, id: u64, head: &ClaimHistoryHead) {
+    let key = DataKey::ClaimHistoryHead(id);
+    env.storage().persistent().set(&key, head);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+}
+
+/// One recorded transition, or `None` when the entry is absent (never written,
+/// or archived after its TTL lapsed). A present entry gets the usual TTL bump.
+pub fn claim_history_entry(env: &Env, id: u64, seq: u32) -> Option<ClaimTransition> {
+    let key = DataKey::ClaimHistoryEntry(id, seq);
+    let entry: Option<ClaimTransition> = env.storage().persistent().get(&key);
+    if entry.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+    }
+    entry
+}
+
+pub fn set_claim_history_entry(env: &Env, entry: &ClaimTransition) {
+    let key = DataKey::ClaimHistoryEntry(entry.claim_id, entry.seq);
+    env.storage().persistent().set(&key, entry);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
 }
 
 // ── Versioned verdicts ───────────────────────────────────────────────────────

@@ -16,6 +16,20 @@ import {
   type PeerReasoningRead,
 } from "../../agents/council/shared/peer-reasoning";
 import { COUNCIL_PERSONAS, type PersonaSpec } from "../../agents/council/personas";
+import type { PayingWallet } from "../../lib/x402/buyer";
+
+const FAKE_PAYER: PayingWallet = {
+  address: "GBUYER111111111111111111111111111111111111111111111111111",
+  signX402Payment: async () => "fake-signature",
+} as unknown as PayingWallet;
+
+function fakeResponse(status: number, body: unknown): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  } as unknown as Response;
+}
 
 describe("selectPeerSellers", () => {
   const personas = COUNCIL_PERSONAS;
